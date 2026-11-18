@@ -233,11 +233,14 @@ export default function RecordMeetingPage() {
         const errData = await tokenRes.json().catch(() => ({}));
         throw new Error(errData.error || "Unable to get Deepgram token");
       }
-      const { token } = (await tokenRes.json()) as { token: string };
+      const { token, auth_type } = (await tokenRes.json()) as {
+        token: string;
+        auth_type?: "bearer" | "token";
+      };
 
       const dgUrl =
         "wss://api.deepgram.com/v1/listen?model=nova-3&language=multi&diarize=true&smart_format=true&interim_results=true&punctuate=true";
-      const ws = new WebSocket(dgUrl, ["token", token]);
+      const ws = new WebSocket(dgUrl, [auth_type ?? "bearer", token]);
       wsRef.current = ws;
 
       ws.onopen = () => {

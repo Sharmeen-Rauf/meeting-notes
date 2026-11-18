@@ -1,7 +1,5 @@
 import { NextResponse } from "next/server";
 import { checkRateLimit, getClientIp } from "@/lib/rate-limit";
-import { createServerSupabaseClient } from "@/lib/supabase/server";
-import { isSupabaseConfigured } from "@/lib/supabase/config";
 
 export async function POST(request: Request) {
   const ip = getClientIp(request);
@@ -11,17 +9,6 @@ export async function POST(request: Request) {
       { error: "Too many token requests. Please wait a moment." },
       { status: 429, headers: { "Retry-After": String(rl.retryAfterSec) } }
     );
-  }
-
-  if (isSupabaseConfigured()) {
-    const supabase = await createServerSupabaseClient();
-    const { data } = (await supabase?.auth.getUser()) ?? { data: { user: null } };
-    if (!data.user) {
-      return NextResponse.json(
-        { error: "Authentication required for live Deepgram transcription." },
-        { status: 401 }
-      );
-    }
   }
 
   const apiKey = process.env.DEEPGRAM_API_KEY?.trim();
@@ -36,7 +23,8 @@ export async function POST(request: Request) {
   }
 
   try {
-    const res = await fetch("https://api.deepgram.com/v1/auth/grant", {
+    // 1. Preferred: Deepgram /v1/auth/grant (short-lived JWT)
+    const grantRes = await fetch("https://api.deepgram.com/v1/auth/grant", {
       method: "POST",
       headers: {
         Authorization: `Token ${apiKey}`,
@@ -45,19 +33,71 @@ export async function POST(request: Request) {
       body: JSON.stringify({ ttl_seconds: 60 }),
     });
 
-    if (!res.ok) {
-      const detail = await res.text();
+    if (grantRes.ok) {
+      const data = (await grantRes.json()) as {
+        access_token: string;
+        expires_in?: number;
+      };
+      return NextResponse.json({
+        token: data.access_token,
+        expires_in: data.expires_in ?? 60,
+        auth_type: "bearer",
+      });
+    }
+
+    // 2. Fallback: Project-scoped 60s temporary key if /v1/auth/grant returned 403
+    if (grantRes.status === 403) {
+      const projRes = await fetch("https://api.deepgram.com/v1/projects", {
+        headers: { Authorization: `Token ${apiKey}` },
+      });
+
+      if (projRes.ok) {
+        const projData = (await projRes.json()) as {
+          projects?: Array<{ project_id: string }>;
+        };
+        const projectId = projData.projects?.[0]?.project_id;
+        if (projectId) {
+          const tempKeyRes = await fetch(
+            `https://api.deepgram.com/v1/projects/${projectId}/keys`,
+            {
+              method: "POST",
+              headers: {
+                Authorization: `Token ${apiKey}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                comment: "meetnotes-temp-60s",
+                scopes: ["usage:write"],
+                time_to_live_in_seconds: 60,
+              }),
+            }
+          );
+
+          if (tempKeyRes.ok) {
+            const tempData = (await tempKeyRes.json()) as { key: string };
+            return NextResponse.json({
+              token: tempData.key,
+              expires_in: 60,
+              auth_type: "token",
+            });
+          }
+        }
+      }
+
       return NextResponse.json(
-        { error: "Failed to create short-lived Deepgram token", detail },
-        { status: 502 }
+        {
+          error:
+            "Deepgram returned 403 Forbidden: your API key lacks permission to mint short-lived tokens. In Deepgram Console → API Keys, create a key with Admin (or Owner) role and update DEEPGRAM_API_KEY.",
+        },
+        { status: 403 }
       );
     }
 
-    const data = (await res.json()) as { access_token: string; expires_in?: number };
-    return NextResponse.json({
-      token: data.access_token,
-      expires_in: data.expires_in ?? 60,
-    });
+    const detail = await grantRes.text();
+    return NextResponse.json(
+      { error: "Failed to create short-lived Deepgram token", detail },
+      { status: 502 }
+    );
   } catch (err) {
     return NextResponse.json(
       {
