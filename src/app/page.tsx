@@ -34,6 +34,43 @@ import { cn, formatMs } from "@/lib/utils";
 import type { MeetingAnalysisResult } from "@/lib/llm/schemas";
 
 type ActiveTab = "transcript" | "notes" | "tasks" | "questions";
+type SpeechLanguage = "multi" | "ur" | "en";
+
+function downsampleBuffer(
+  buffer: Float32Array,
+  inputSampleRate: number,
+  outputSampleRate: number
+): Float32Array {
+  if (inputSampleRate === outputSampleRate) return buffer;
+  const ratio = inputSampleRate / outputSampleRate;
+  const newLength = Math.round(buffer.length / ratio);
+  const result = new Float32Array(newLength);
+  let offsetResult = 0;
+  let offsetBuffer = 0;
+  while (offsetResult < result.length) {
+    const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+    let accum = 0;
+    let count = 0;
+    for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+      accum += buffer[i];
+      count++;
+    }
+    result[offsetResult] = count > 0 ? accum / count : 0;
+    offsetResult++;
+    offsetBuffer = nextOffsetBuffer;
+  }
+  return result;
+}
+
+function floatTo16BitPCM(input: Float32Array): ArrayBuffer {
+  const buffer = new ArrayBuffer(input.length * 2);
+  const view = new DataView(buffer);
+  for (let i = 0; i < input.length; i++) {
+    const s = Math.max(-1, Math.min(1, input[i]));
+    view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return buffer;
+}
 
 function mergeAnalysis(
   analysis: MeetingAnalysisResult,
@@ -111,6 +148,8 @@ export default function RecordMeetingPage() {
 
   const [departments, setDepartments] = useState<string[]>([...DEFAULT_DEPARTMENTS]);
   const [outputLanguage, setOutputLanguage] = useState<OutputLanguage>("English");
+  const [speechLanguage, setSpeechLanguage] = useState<SpeechLanguage>("multi");
+  const [micLevel, setMicLevel] = useState(0);
 
   const [segments, setSegments] = useState<TranscriptSegment[]>([]);
   const [interimText, setInterimText] = useState<string>("");
@@ -132,6 +171,9 @@ export default function RecordMeetingPage() {
   const wsRef = useRef<WebSocket | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const keepAliveTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
   const reconnectAttemptRef = useRef<number>(0);
@@ -238,8 +280,7 @@ export default function RecordMeetingPage() {
         auth_type?: "bearer" | "token";
       };
 
-      const dgUrl =
-        "wss://api.deepgram.com/v1/listen?model=nova-3&language=multi&diarize=true&smart_format=true&interim_results=true&punctuate=true";
+      const dgUrl = `wss://api.deepgram.com/v1/listen?model=nova-3&language=${speechLanguage}&encoding=linear16&sample_rate=16000&channels=1&diarize=true&smart_format=true&interim_results=true&punctuate=true`;
       const ws = new WebSocket(dgUrl, [auth_type ?? "bearer", token]);
       wsRef.current = ws;
 
@@ -247,6 +288,12 @@ export default function RecordMeetingPage() {
         reconnectAttemptRef.current = 0;
         setStatus("connected");
         setErrorMsg(null);
+        if (keepAliveTimerRef.current) clearInterval(keepAliveTimerRef.current);
+        keepAliveTimerRef.current = setInterval(() => {
+          if (wsRef.current?.readyState === WebSocket.OPEN) {
+            wsRef.current.send(JSON.stringify({ type: "KeepAlive" }));
+          }
+        }, 8000);
       };
 
       ws.onmessage = (event) => {
@@ -316,7 +363,7 @@ export default function RecordMeetingPage() {
       );
       setStatus("recording");
     }
-  }, []);
+  }, [speechLanguage]);
 
   const startLiveMeeting = async () => {
     setErrorMsg(null);
@@ -334,29 +381,70 @@ export default function RecordMeetingPage() {
     setElapsedMs(0);
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
       streamRef.current = stream;
       isRecordingRef.current = true;
       setStatus("recording");
       await acquireWakeLock();
 
+      // 1. Connect Deepgram first, then stream raw 16kHz linear16 PCM (headerless, reliable on Chrome + Safari)
+      await connectDeepgram();
+
+      const audioCtx = new AudioContext();
+      audioCtxRef.current = audioCtx;
+      if (audioCtx.state === "suspended") {
+        await audioCtx.resume();
+      }
+      const source = audioCtx.createMediaStreamSource(stream);
+      const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+      processorRef.current = processor;
+
+      processor.onaudioprocess = (event) => {
+        if (!isRecordingRef.current) return;
+        const input = event.inputBuffer.getChannelData(0);
+
+        // Compute simple RMS mic level (0-100) for UI feedback
+        let sumSq = 0;
+        for (let i = 0; i < input.length; i++) {
+          sumSq += input[i] * input[i];
+        }
+        const rms = Math.sqrt(sumSq / input.length);
+        setMicLevel(Math.min(100, Math.round(rms * 400)));
+
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          const downsampled = downsampleBuffer(input, audioCtx.sampleRate, 16000);
+          const pcm = floatTo16BitPCM(downsampled);
+          wsRef.current.send(pcm);
+        }
+      };
+
+      source.connect(processor);
+      processor.connect(audioCtx.destination);
+
+      // 2. MediaRecorder runs separately only to save the full audio file
       const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
         ? "audio/webm;codecs=opus"
-        : "audio/webm";
-      const recorder = new MediaRecorder(stream, { mimeType });
+        : MediaRecorder.isTypeSupported("audio/webm")
+          ? "audio/webm"
+          : "";
+      const recorder = mimeType
+        ? new MediaRecorder(stream, { mimeType })
+        : new MediaRecorder(stream);
       recorderRef.current = recorder;
 
       recorder.ondataavailable = (ev) => {
         if (ev.data.size > 0) {
           audioChunksRef.current.push(ev.data);
-          if (wsRef.current?.readyState === WebSocket.OPEN) {
-            wsRef.current.send(ev.data);
-          }
         }
       };
 
-      recorder.start(250);
-      await connectDeepgram();
+      recorder.start(1000);
 
       clockTimerRef.current = setInterval(() => {
         setElapsedMs(Date.now() - startPerfRef.current);
@@ -440,8 +528,27 @@ export default function RecordMeetingPage() {
     if (demoTimerRef.current) clearInterval(demoTimerRef.current);
     if (analyzeTimerRef.current) clearInterval(analyzeTimerRef.current);
     if (clockTimerRef.current) clearInterval(clockTimerRef.current);
+    if (keepAliveTimerRef.current) clearInterval(keepAliveTimerRef.current);
+    setMicLevel(0);
+
+    if (processorRef.current) {
+      processorRef.current.disconnect();
+      processorRef.current = null;
+    }
+
+    if (audioCtxRef.current) {
+      await audioCtxRef.current.close().catch(() => {});
+      audioCtxRef.current = null;
+    }
 
     if (wsRef.current) {
+      try {
+        if (wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify({ type: "CloseStream" }));
+        }
+      } catch {
+        // Ignore
+      }
       wsRef.current.close();
       wsRef.current = null;
     }
@@ -497,6 +604,9 @@ export default function RecordMeetingPage() {
       if (demoTimerRef.current) clearInterval(demoTimerRef.current);
       if (analyzeTimerRef.current) clearInterval(analyzeTimerRef.current);
       if (clockTimerRef.current) clearInterval(clockTimerRef.current);
+      if (keepAliveTimerRef.current) clearInterval(keepAliveTimerRef.current);
+      processorRef.current?.disconnect();
+      audioCtxRef.current?.close().catch(() => {});
       wsRef.current?.close();
       streamRef.current?.getTracks().forEach((t) => t.stop());
       releaseWakeLock();
@@ -582,28 +692,61 @@ export default function RecordMeetingPage() {
         )}
 
         {!isActive ? (
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <button
-              type="button"
-              disabled={!consentAck}
-              onClick={startLiveMeeting}
-              className="flex items-center justify-center gap-2.5 rounded-xl bg-blue-600 px-6 py-4 text-base font-semibold text-white shadow-sm transition hover:bg-blue-700 disabled:opacity-50"
-            >
-              <Mic className="h-5 w-5" />
-              Start Meeting
-            </button>
+          <div className="space-y-3">
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <span className="font-medium text-slate-500 dark:text-slate-400">
+                Speech Language:
+              </span>
+              <select
+                value={speechLanguage}
+                onChange={(e) =>
+                  setSpeechLanguage(e.target.value as SpeechLanguage)
+                }
+                className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 font-medium dark:border-slate-700 dark:bg-slate-800"
+              >
+                <option value="multi">Mixed (Urdu/Hindi + English)</option>
+                <option value="ur">Urdu Only (اردو)</option>
+                <option value="en">English Only</option>
+              </select>
+            </div>
 
-            <button
-              type="button"
-              disabled={!consentAck}
-              onClick={startDemoMeeting}
-              className="flex items-center justify-center gap-2 rounded-xl border border-slate-300 bg-slate-50 px-5 py-4 text-sm font-semibold text-slate-800 transition hover:bg-slate-100 disabled:opacity-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:hover:bg-slate-700"
-            >
-              <Play className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
-              Run Demo Meeting (No Mic)
-            </button>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <button
+                type="button"
+                disabled={!consentAck}
+                onClick={startLiveMeeting}
+                className="flex items-center justify-center gap-2.5 rounded-xl bg-blue-600 px-6 py-4 text-base font-semibold text-white shadow-sm transition hover:bg-blue-700 disabled:opacity-50"
+              >
+                <Mic className="h-5 w-5" />
+                Start Meeting
+              </button>
+
+              <button
+                type="button"
+                disabled={!consentAck}
+                onClick={startDemoMeeting}
+                className="flex items-center justify-center gap-2 rounded-xl border border-slate-300 bg-slate-50 px-5 py-4 text-sm font-semibold text-slate-800 transition hover:bg-slate-100 disabled:opacity-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:hover:bg-slate-700"
+              >
+                <Play className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+                Run Demo Meeting (No Mic)
+              </button>
+            </div>
           </div>
         ) : (
+          <div className="space-y-3">
+            {!isDemoRunning && (
+              <div className="flex items-center gap-2">
+                <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400 shrink-0">
+                  Mic Level
+                </span>
+                <div className="h-2 flex-1 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800">
+                  <div
+                    className="h-full bg-emerald-500 transition-all duration-100"
+                    style={{ width: `${micLevel}%` }}
+                  />
+                </div>
+              </div>
+            )}
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
               <Sparkles className="h-4 w-4 text-blue-500" />
@@ -633,6 +776,7 @@ export default function RecordMeetingPage() {
                 {status === "processing" ? "Finalizing..." : "End Meeting"}
               </button>
             </div>
+          </div>
           </div>
         )}
       </section>
