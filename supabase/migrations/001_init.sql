@@ -1,5 +1,5 @@
 -- MeetNotes Supabase Schema + Row Level Security (RLS)
--- Run this in Supabase SQL Editor or via `supabase db push`
+-- Safe to re-run (idempotent) in Supabase SQL Editor or via `supabase db push`
 
 create extension if not exists pgcrypto;
 
@@ -16,14 +16,17 @@ create table if not exists public.user_settings (
 
 alter table public.user_settings enable row level security;
 
+drop policy if exists "Users can view own settings" on public.user_settings;
 create policy "Users can view own settings"
   on public.user_settings for select
   using (auth.uid() = user_id);
 
+drop policy if exists "Users can insert own settings" on public.user_settings;
 create policy "Users can insert own settings"
   on public.user_settings for insert
   with check (auth.uid() = user_id);
 
+drop policy if exists "Users can update own settings" on public.user_settings;
 create policy "Users can update own settings"
   on public.user_settings for update
   using (auth.uid() = user_id);
@@ -59,6 +62,7 @@ create index if not exists meetings_search_idx
 
 alter table public.meetings enable row level security;
 
+drop policy if exists "Users can CRUD own meetings" on public.meetings;
 create policy "Users can CRUD own meetings"
   on public.meetings for all
   using (auth.uid() = user_id)
@@ -83,6 +87,7 @@ create index if not exists transcript_segments_meeting_idx
 
 alter table public.transcript_segments enable row level security;
 
+drop policy if exists "Users can CRUD own transcript segments" on public.transcript_segments;
 create policy "Users can CRUD own transcript segments"
   on public.transcript_segments for all
   using (auth.uid() = user_id)
@@ -105,6 +110,7 @@ create index if not exists meeting_notes_meeting_idx
 
 alter table public.meeting_notes enable row level security;
 
+drop policy if exists "Users can CRUD own meeting notes" on public.meeting_notes;
 create policy "Users can CRUD own meeting notes"
   on public.meeting_notes for all
   using (auth.uid() = user_id)
@@ -131,6 +137,7 @@ create index if not exists tasks_user_status_idx
 
 alter table public.tasks enable row level security;
 
+drop policy if exists "Users can CRUD own tasks" on public.tasks;
 create policy "Users can CRUD own tasks"
   on public.tasks for all
   using (auth.uid() = user_id)
@@ -156,6 +163,7 @@ create index if not exists questions_meeting_idx
 
 alter table public.questions enable row level security;
 
+drop policy if exists "Users can CRUD own questions" on public.questions;
 create policy "Users can CRUD own questions"
   on public.questions for all
   using (auth.uid() = user_id)
@@ -166,6 +174,7 @@ insert into storage.buckets (id, name, public)
 values ('meeting-audio', 'meeting-audio', false)
 on conflict (id) do nothing;
 
+drop policy if exists "Users can upload own meeting audio" on storage.objects;
 create policy "Users can upload own meeting audio"
   on storage.objects for insert
   with check (
@@ -173,6 +182,7 @@ create policy "Users can upload own meeting audio"
     and auth.uid()::text = (storage.foldername(name))[1]
   );
 
+drop policy if exists "Users can view own meeting audio" on storage.objects;
 create policy "Users can view own meeting audio"
   on storage.objects for select
   using (
@@ -180,6 +190,7 @@ create policy "Users can view own meeting audio"
     and auth.uid()::text = (storage.foldername(name))[1]
   );
 
+drop policy if exists "Users can delete own meeting audio" on storage.objects;
 create policy "Users can delete own meeting audio"
   on storage.objects for delete
   using (

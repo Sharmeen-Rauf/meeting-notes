@@ -79,7 +79,8 @@ export default function LoginPage() {
         <p className="text-xs text-slate-500 dark:text-slate-400">
           To enable cloud sync, audio storage, and login, add{" "}
           <code>NEXT_PUBLIC_SUPABASE_URL</code> and{" "}
-          <code>NEXT_PUBLIC_SUPABASE_ANON_KEY</code> in <code>.env.local</code>.
+          <code>NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY</code> in{" "}
+          <code>.env.local</code>.
         </p>
         <button
           type="button"
