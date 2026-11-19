@@ -239,7 +239,13 @@ export default function RecordMeetingPage() {
             existingQuestions: questionsRef.current,
           }),
         });
-        if (!res.ok) return null;
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          setErrorMsg(
+            errData.detail || errData.error || "Failed to generate notes."
+          );
+          return null;
+        }
         const data = (await res.json()) as {
           analysis: MeetingAnalysisResult;
         };

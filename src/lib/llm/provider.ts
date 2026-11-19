@@ -49,9 +49,47 @@ export class GeminiProvider implements LLMProvider {
   private client: GoogleGenAI;
   private model: string;
 
-  constructor(apiKey: string, model = process.env.GEMINI_MODEL || "gemini-2.5-flash") {
+  constructor(
+    apiKey: string,
+    model = process.env.GEMINI_MODEL?.trim() || "gemini-flash-latest"
+  ) {
     this.client = new GoogleGenAI({ apiKey });
     this.model = model;
+  }
+
+  private async generateJsonText(
+    systemInstruction: string,
+    contents: string
+  ): Promise<string> {
+    const candidates = Array.from(
+      new Set([
+        this.model,
+        "gemini-flash-latest",
+        "gemini-3.8-flash",
+        "gemini-3.5-flash",
+      ])
+    );
+
+    let lastError: unknown;
+    for (const modelName of candidates) {
+      try {
+        const response = await this.client.models.generateContent({
+          model: modelName,
+          contents,
+          config: {
+            systemInstruction,
+            responseMimeType: "application/json",
+            temperature: 0.1,
+          },
+        });
+        return response.text ?? "{}";
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    throw lastError instanceof Error
+      ? lastError
+      : new Error("All Gemini models failed");
   }
 
   async analyzeMeeting(input: AnalyzeMeetingInput): Promise<MeetingAnalysisResult> {
@@ -94,17 +132,7 @@ export class GeminiProvider implements LLMProvider {
       })),
     });
 
-    const response = await this.client.models.generateContent({
-      model: this.model,
-      contents: userContent,
-      config: {
-        systemInstruction,
-        responseMimeType: "application/json",
-        temperature: 0.1,
-      },
-    });
-
-    const rawText = response.text ?? "{}";
+    const rawText = await this.generateJsonText(systemInstruction, userContent);
     const parsed = JSON.parse(extractJsonText(rawText));
     return MeetingAnalysisSchema.parse(parsed);
   }
@@ -141,20 +169,13 @@ export class GeminiProvider implements LLMProvider {
       transcript_excerpt: m.transcript_text.slice(0, 4000),
     }));
 
-    const response = await this.client.models.generateContent({
-      model: this.model,
-      contents: JSON.stringify({
+    const rawText = await this.generateJsonText(
+      systemInstruction,
+      JSON.stringify({
         user_question: input.question,
         meetings: context,
-      }),
-      config: {
-        systemInstruction,
-        responseMimeType: "application/json",
-        temperature: 0.1,
-      },
-    });
-
-    const rawText = response.text ?? "{}";
+      })
+    );
     const parsed = JSON.parse(extractJsonText(rawText));
     return AskAIResponseSchema.parse(parsed);
   }
